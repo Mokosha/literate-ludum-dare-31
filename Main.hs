@@ -284,7 +284,7 @@ startGame dict = (pure idleStage >>> delay fadeToGame >>> for timeToFade) --> (g
 gameOver :: Dict -> StageWire
 gameOver dict = (pure idleStage >>> delay fadeToGameOver >>>
                  ((mkId >>> for timeToFade) --> L.quitWire GLFW.Key'Space)) -->
-                (pure idleStage >>> delay fadeFromGameOver >>> for timeToFade) -->
+                (pure idleStage >>> delay fadeFromGameOver >>> mkEmpty) -->
                 introSequence -->
                 (gameMenu dict)
   where
@@ -420,7 +420,7 @@ gameWire :: Dict -> StageWire
 gameWire dict =
   ((runTime &&& runGame initialState runGameState) >>> setTimeWire) --> gameOver dict
   where
-    startTime = 50.0
+    startTime = 100.0
 
     runTime :: L.GameWire a Float
     runTime = timer startTime >>> W.when (>0)
