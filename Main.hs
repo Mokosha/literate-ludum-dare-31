@@ -108,6 +108,11 @@ drawChar fnt ((x, y), c) =
       letterPos = V2 ((x - 1) * letterSzX) (screenSizeY - y * letterSzY)
       offset = V2 4 2
 
+data LetterState
+  = LetterChanging
+  | LetterStatic
+  deriving (Ord, Eq, Show, Enum, Bounded)
+  
 data LetterInput
   = ChangeImmediately !(V3 Float)
   | ChangeGradually !Float !(V3 Float)
@@ -116,32 +121,43 @@ data LetterInput
 data LetterOutput = LetterOutput {
   outputChar :: !Char,
   outputColor :: !(V3 Float),
-  outputClick :: !Bool
+  outputClick :: !Bool,
+  outputState :: !LetterState
 } deriving (Ord, Eq, Show)
 
 type LetterWire = L.GameWire (Event LetterInput) LetterOutput
 
-mkWiresFromChars :: Array (Int, Int) Char -> Array (Int, Int) LetterWire
-mkWiresFromChars arr = array (bounds arr) $ (\(ix, c) -> (ix, letterWire (V3 1 1 1) (ix, c))) <$> (assocs arr)
+mkWiresFromChars :: Array (Int, Int) Char -> Array (Int, Int) (LetterOutput, LetterWire)
+mkWiresFromChars arr = array (bounds arr) $ (\(ix, c) ->
+                                              let output = LetterOutput c (V3 1 1 1) False LetterStatic
+                                                  wire = letterWire (V3 1 1 1) (ix, c)
+                                              in (ix, (output, wire))) <$> (assocs arr)
 
 letterWire :: V3 Float -> ((Int, Int), Char) -> LetterWire
 letterWire initialColor (pos, c) = proc x -> do
-  color <- handleColor initialColor -< x
-  returnA -< (LetterOutput c color False)
+  out <- handleColor initialColor -< x
+  returnA -< out
   where
-    colorFeedback :: V3 Float -> L.GameWire (Event LetterInput, V3 Float) (V3 Float, V3 Float)
-    colorFeedback c =
-      let lerpWire :: Float -> V3 Float -> V3 Float -> L.GameWire a (V3 Float)
-          lerpWire duration start end = (timeF / pure duration) >>> (arr $ \t -> lerp t end start)
+    colorFeedback :: V3 Float -> L.GameWire (Event LetterInput, V3 Float) (LetterOutput, V3 Float)
+    colorFeedback init =
+      let lerpWire :: Float -> V3 Float -> V3 Float -> L.GameWire a LetterOutput
+          lerpWire duration start end = proc x -> do
+            t <- timeF / pure duration -< x
+            color <- (arr $ \t' -> lerp t' end start) -< t
+            returnA -< (LetterOutput c color False LetterChanging)
 
-          modeSelect :: LetterInput -> L.GameWire (V3 Float) (V3 Float)
-          modeSelect (ChangeImmediately newColor) = pure newColor
+          pureColor color = proc x -> do
+            returnA -< (LetterOutput c color False LetterStatic)
+
+          modeSelect :: LetterInput -> L.GameWire (V3 Float) LetterOutput
+          modeSelect (ChangeImmediately newColor) = pureColor newColor
           modeSelect (ChangeGradually t newColor) =
-            mkSFN $ \oldColor -> (oldColor, (lerpWire t oldColor newColor >>> for t) --> pure newColor)
+            mkSFN $ \oldColor -> (LetterOutput c oldColor False LetterChanging,
+                                  (lerpWire t oldColor newColor >>> for t) --> pureColor newColor)
 
-      in (arr swap) >>> (modes (ChangeImmediately c) modeSelect) >>> (mkId &&& mkId)
+      in (arr swap) >>> (modes (ChangeImmediately init) modeSelect) >>> (mkId &&& (arr outputColor))
 
-    handleColor :: V3 Float -> L.GameWire (Event LetterInput) (V3 Float)
+    handleColor :: V3 Float -> L.GameWire (Event LetterInput) LetterOutput
     handleColor c = loop $ second (delay c) >>> colorFeedback c
 
 type StageInput = Array (Int, Int) LetterOutput
@@ -149,11 +165,17 @@ type StageOutput = Array (Int, Int) (Maybe LetterInput)
 
 type StageWire = L.GameWire StageInput StageOutput
 
-handleLetters :: L.TimeStep -> StageOutput -> Array (Int, Int) LetterWire ->
-                 L.GameMonad (StageInput, Array (Int, Int) LetterWire)
+handleLetters :: L.TimeStep -> StageOutput -> Array (Int, Int) (LetterOutput, LetterWire) ->
+                 L.GameMonad (StageInput, Array (Int, Int) (LetterOutput, LetterWire))
 handleLetters ts letterIpts letterWires = do
-  arr <- mapM runWire $ [(ix, (letterIpts ! ix, letterWires ! ix)) | ix <- indices letterIpts]
-  return $ (array (bounds letterIpts) (map (fst <$>) arr), array (bounds letterIpts) (map (snd <$>) arr))
+  arr <- mapM runWire $ do
+    ix <- indices letterIpts
+    let li = letterIpts ! ix
+        (lst, lw) = letterWires ! ix
+    guard (li /= Nothing || outputState lst == LetterChanging)
+    return (ix, (li, lw))
+  return $ ((fst <$> letterWires) // (map (fst <$>) arr),
+            (letterWires // arr))
   where
     runWire :: (i, (Maybe LetterInput, LetterWire)) -> L.GameMonad (i, (LetterOutput, LetterWire))
     runWire (x, (Nothing, wire)) = do
@@ -165,10 +187,10 @@ handleLetters ts letterIpts letterWires = do
 
 renderLetters :: L.Font -> Array (Int, Int) LetterOutput -> L.GameMonad ()
 renderLetters font arr =
-  let charGrps = groupBy (\(_, LetterOutput _ x _) (_, LetterOutput _ y _) -> x == y) $ assocs arr
-  in mapM_ (\(chars@((_, LetterOutput _ color _) : _)) ->
+  let charGrps = groupBy (\(_, LetterOutput _ x _ _) (_, LetterOutput _ y _ _) -> x == y) $ assocs arr
+  in mapM_ (\(chars@((_, LetterOutput _ color _ _) : _)) ->
               let newFont = L.setFontColor color font
-              in mapM_ (\(ix, LetterOutput c _ _) -> drawChar newFont (ix, c)) chars) charGrps
+              in mapM_ (\(ix, LetterOutput c _ _ _) -> drawChar newFont (ix, c)) chars) charGrps
 
 checkClicked :: StageInput -> L.GameMonad StageInput
 checkClicked ipt = do
@@ -182,24 +204,24 @@ checkClicked ipt = do
           sy = (my * 0.5 + 0.5) * (fromIntegral screenSizeY)
           x = ceiling $ sx / (fromIntegral letterSzX)
           y = ceiling $ sy / (fromIntegral letterSzY)
-          LetterOutput c color _ = ipt ! (x, y)
-      return $ ipt // [((x, y), LetterOutput c color True)]
+          LetterOutput c color _ st = ipt ! (x, y)
+      return $ ipt // [((x, y), LetterOutput c color True st)]
 
 mkGame :: StageWire -> IO (L.GameWire () ())
 mkGame w = do
   board <- gameBoardString
   let initialLetters = mkWiresFromChars board
-      dummyStageOutput = (\c -> LetterOutput c (V3 1 1 1) False) <$> board
+      dummyStageOutput = (\c -> LetterOutput c (V3 1 1 1) False LetterStatic) <$> board
   font <- L.loadTTFont 18 (V3 1 1 1) "kenpixel.ttf"
   return $ runStage font initialLetters dummyStageOutput w
     where
-      runStage :: L.Font -> Array (Int, Int) LetterWire -> StageInput -> StageWire -> L.GameWire () ()
-      runStage font letters ipt w = mkGen $ \s _ -> do
-        (result, nextStage) <- checkClicked ipt >>= (stepWire w s . Right)
+      runStage :: L.Font -> Array (Int, Int) (LetterOutput, LetterWire) -> StageInput -> StageWire -> L.GameWire () ()
+      runStage font letters ipt w = mkGen $ \ts _ -> do
+        (result, nextStage) <- checkClicked ipt >>= (stepWire w ts . Right)
         case result of
           Left x -> return (Left x, mkEmpty)
           Right letterInput -> do
-            (nextIpt, nextLetters) <- handleLetters s letterInput letters
+            (nextIpt, nextLetters) <- handleLetters ts letterInput letters
             renderLetters font nextIpt
             return $ (Right (), runStage font nextLetters nextIpt nextStage)
 
@@ -244,7 +266,7 @@ introSequence = pure idleStage >>> delay fadeToMenu >>> for timeToFade
       | y == gameDimY = fadeToWhite
       | (x, y) `elem` titlePositions = Just $ ChangeGradually timeToFade (V3 0 0.9 0.9)
       | (x, y) `elem` menuOption = fadeToWhite
-      | otherwise = Just $ ChangeGradually timeToFade (V3 0.1 0.1 0.1)
+      | otherwise = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
       where
         menuOption = startGamePositions ++ quitGamePositions
 
@@ -257,7 +279,7 @@ startGame dict = (pure idleStage >>> delay fadeToGame >>> for timeToFade) --> (g
     introInput _ 1 = Nothing
     introInput x y
       | y == gameDimY = Nothing
-      | otherwise = Just $ ChangeGradually timeToFade (V3 0.1 0.1 0.1)
+      | otherwise = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
 
 gameOver :: Dict -> StageWire
 gameOver dict = (pure idleStage >>> delay fadeToGameOver >>>
@@ -273,10 +295,10 @@ gameOver dict = (pure idleStage >>> delay fadeToGameOver >>>
     gameOverInput x y
       | y == gameDimY = Nothing
       | (x, y) `elem` gameOverPositions = Just $ ChangeGradually timeToFade (V3 0.4 0.1 0.1)
-      | otherwise = Just $ ChangeGradually timeToFade (V3 0.1 0.1 0.1)
+      | otherwise = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
 
     fadeFromGameOver = mkStaticStageInput gameOverOutput
-    gameOverOutput _ _ = Just $ ChangeGradually timeToFade (V3 0.1 0.1 0.1)
+    gameOverOutput _ _ = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
 
 numberToPositions :: Int -> Int -> [(Int, Int)]
 numberToPositions x row =
@@ -354,7 +376,7 @@ mkNewLetterGameWire = do
 
 runLetter :: L.TimeStep -> StageInput -> LetterGameWire -> StateT LState L.GameMonad [(Maybe LetterInput, LetterGameWire)]
 runLetter ts ipt (pos, w) = do
-  let LetterOutput c _ click = ipt ! pos
+  let LetterOutput c _ click _ = ipt ! pos
   case click of
     False -> do
       (result, w') <- lift $ stepWire w ts (Right ())
@@ -494,13 +516,6 @@ gameMenu dict = runWire (selection 0 >>> flickerSelection)
         Left "Quit" -> return (Right idleStage, mkEmpty)
         Left x -> error $ "Unknown menu option: " ++ x
         Right x -> return (Right x, runWire w')
-
-clickYellow :: StageWire
-clickYellow = mkSF_ (changeClicked <$>)
-  where
-    changeClicked :: LetterOutput -> Maybe LetterInput
-    changeClicked (LetterOutput _ _ False) = Nothing
-    changeClicked (LetterOutput _ _ True) = Just $ ChangeGradually 0.3 (V3 0 1 1)
 
 initialStage :: L.GameWire a StageOutput
 initialStage =
