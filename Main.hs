@@ -61,7 +61,7 @@ merge [] ys = ys
 merge (x:xs) ys = x : merge ys xs
 
 mkGameRow :: (Functor m, MonadRandom m) => m String
-mkGameRow = filter isAsciiLower <$> getRandoms
+mkGameRow = filter isAsciiLower <$> getRandomRs ('a', 'z')
 
 mkGameRowWithString :: (Functor m, MonadRandom m) => String -> Int -> m String
 mkGameRowWithString str pos = do
@@ -132,15 +132,12 @@ letterWire initialColor (pos, c) = proc x -> do
     colorFeedback :: V3 Float -> L.GameWire (Event LetterInput, V3 Float) (V3 Float, V3 Float)
     colorFeedback c =
       let lerpWire :: Float -> V3 Float -> V3 Float -> L.GameWire a (V3 Float)
-          lerpWire duration start end = timeF >>>
-                                        (arr (/ duration)) >>>
-                                        (W.unless (> 1.0)) >>>
-                                        (arr $ \t -> lerp t end start)
+          lerpWire duration start end = (timeF / pure duration) >>> (arr $ \t -> lerp t end start)
 
           modeSelect :: LetterInput -> L.GameWire (V3 Float) (V3 Float)
           modeSelect (ChangeImmediately newColor) = pure newColor
           modeSelect (ChangeGradually t newColor) =
-            mkSFN $ \oldColor -> (oldColor, lerpWire t oldColor newColor --> pure newColor)
+            mkSFN $ \oldColor -> (oldColor, (lerpWire t oldColor newColor >>> for t) --> pure newColor)
 
       in (arr swap) >>> (modes (ChangeImmediately c) modeSelect) >>> (mkId &&& mkId)
 
