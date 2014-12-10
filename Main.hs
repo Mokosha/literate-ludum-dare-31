@@ -541,10 +541,5 @@ initGame = do
     L.gameLogic = g }
 
 main :: IO ()
-main = do
-  m <- L.makeWindow screenSizeX screenSizeY "Literate"
-  g <- initGame
-  case m of
-    (Just win) -> L.run win () g
-    Nothing -> return ()
-  L.destroyWindow m
+main = L.withWindow screenSizeX screenSizeY "Literate" $
+       L.loadAndRun () initGame
