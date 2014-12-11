@@ -133,6 +133,9 @@ mkWiresFromChars arr = array (bounds arr) $ (\(ix, c) ->
                                                   wire = letterWire (V3 1 1 1) (ix, c)
                                               in (ix, (output, wire))) <$> (assocs arr)
 
+resetModes :: (Functor m, Monad m, Monoid s) => k -> (k -> Wire s e m a b) -> Wire s e m (a, Event k) b
+resetModes initial f = second (arr (fmap f)) >>> rSwitch (f initial)
+
 letterWire :: V3 Float -> ((Int, Int), Char) -> LetterWire
 letterWire initialColor (pos, c) = proc x -> do
   out <- handleColor initialColor -< x
@@ -155,7 +158,7 @@ letterWire initialColor (pos, c) = proc x -> do
             mkSFN $ \oldColor -> (LetterOutput c oldColor False LetterChanging,
                                   (lerpWire t oldColor newColor >>> for t) --> pureColor newColor)
 
-      in (arr swap) >>> (modes (ChangeImmediately init) modeSelect) >>> (mkId &&& (arr outputColor))
+      in (arr swap) >>> (resetModes (ChangeImmediately init) modeSelect) >>> (mkId &&& (arr outputColor))
 
     handleColor :: V3 Float -> L.GameWire (Event LetterInput) LetterOutput
     handleColor c = loop $ second (delay c) >>> colorFeedback c
@@ -190,7 +193,8 @@ renderLetters font arr =
   let charGrps = groupBy (\(_, LetterOutput _ x _ _) (_, LetterOutput _ y _ _) -> x == y) $ assocs arr
   in mapM_ (\(chars@((_, LetterOutput _ color _ _) : _)) ->
               let newFont = L.setFontColor color font
-              in mapM_ (\(ix, LetterOutput c _ _ _) -> drawChar newFont (ix, c)) chars) charGrps
+              in mapM_ (\(ix, LetterOutput c _ _ _) -> do
+                           drawChar newFont (ix, c)) chars) charGrps
 
 checkClicked :: StageInput -> L.GameMonad StageInput
 checkClicked ipt = do
@@ -252,10 +256,17 @@ quitGamePositions = [(11 + x, 18) | x <- [0,2,4,6]]
 idleStage :: StageOutput
 idleStage = mkStaticStageInput (\x y -> Nothing)
 
+prepareStage :: StageWire -> StageWire
+prepareStage = (delay mkBoard <<<)
+  where
+    mkBoard = mkStaticStageInput inputBoard
+    inputBoard _ _ = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
+
 introSequence :: StageWire
-introSequence = pure idleStage >>> delay fadeToMenu >>> for timeToFade
+introSequence = prepareStage (pure idleStage >>> delay fadeToMenu >>> for timeToFade)
   where
     timeToFade = 2.0
+
     fadeToMenu = mkStaticStageInput introInput
     fadeToWhite = Just $ ChangeGradually timeToFade (V3 1 1 1)
     introInput :: Int -> Int -> Maybe LetterInput
@@ -265,15 +276,12 @@ introSequence = pure idleStage >>> delay fadeToMenu >>> for timeToFade
       | x == gameDimX = fadeToWhite
       | y == gameDimY = fadeToWhite
       | (x, y) `elem` titlePositions = Just $ ChangeGradually timeToFade (V3 0 0.9 0.9)
-      | (x, y) `elem` menuOption = fadeToWhite
-      | otherwise = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
-      where
-        menuOption = startGamePositions ++ quitGamePositions
+      | (x, y) `elem` kMenuPositions = fadeToWhite
+      | otherwise = Nothing
 
 startGame :: Dict -> StageWire
-startGame dict = (pure idleStage >>> delay fadeToGame >>> for timeToFade) --> (gameWire dict)
+startGame dict = prepareStage $ (pure idleStage >>> delay fadeToGame >>> mkEmpty) --> (gameWire dict)
   where
-    timeToFade = 2.0
     fadeToGame = mkStaticStageInput introInput
     introInput :: Int -> Int -> Maybe LetterInput
     introInput _ 1 = Nothing
@@ -284,7 +292,6 @@ startGame dict = (pure idleStage >>> delay fadeToGame >>> for timeToFade) --> (g
 gameOver :: Dict -> StageWire
 gameOver dict = (pure idleStage >>> delay fadeToGameOver >>>
                  ((mkId >>> for timeToFade) --> L.quitWire GLFW.Key'Space)) -->
-                (pure idleStage >>> delay fadeFromGameOver >>> mkEmpty) -->
                 introSequence -->
                 (gameMenu dict)
   where
@@ -296,9 +303,6 @@ gameOver dict = (pure idleStage >>> delay fadeToGameOver >>>
       | y == gameDimY = Nothing
       | (x, y) `elem` gameOverPositions = Just $ ChangeGradually timeToFade (V3 0.4 0.1 0.1)
       | otherwise = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
-
-    fadeFromGameOver = mkStaticStageInput gameOverOutput
-    gameOverOutput _ _ = Just $ ChangeImmediately (V3 0.1 0.1 0.1)
 
 numberToPositions :: Int -> Int -> [(Int, Int)]
 numberToPositions x row =
@@ -325,6 +329,11 @@ setScore x = setNumberRow x 1 (V3 0.9 0.1 0.1)
 setTime :: Int -> StageOutput -> StageOutput
 setTime x = setNumberRow x gameDimY (V3 0.2 0.6 0.2)
 
+intWire :: (Int -> StageOutput -> StageOutput) -> L.GameWire (StageOutput, Int) StageOutput
+intWire f = mkSFN $ \(output, x) -> (f x output, loop $ second (delay x) >>> intFeedback)
+  where
+    intFeedback :: L.GameWire ((StageOutput, Int), Int) (StageOutput, Int)
+    intFeedback = mkSF_ $ \((output, x), x') -> (if x == x' then output else f x output, x)
 
 data BoardChar = BoardChar Char (Int, Int)
 
@@ -360,7 +369,7 @@ genNewLetterGameWire :: StateT LState L.GameMonad LetterGameWire
 genNewLetterGameWire = do
   lstate <- get
   let (x, g') = randomR (1, gameDimX) (stateGen lstate)
-      (y, g'') = randomR (1, gameDimY) g'
+      (y, g'') = randomR (2, gameDimY - 1) g'
       (fadeTime, g''') = randomR (0.5, 1.0) g''
 
   put $ lstate { stateGen = g''' }
@@ -418,7 +427,7 @@ runLetters dict ts ipt = do
 
 gameWire :: Dict -> StageWire
 gameWire dict =
-  ((runTime &&& runGame initialState runGameState) >>> setTimeWire) --> gameOver dict
+  ((runTime &&& runGame initialState (runGameState >>> setScoreWire)) >>> setTimeWire) --> gameOver dict
   where
     startTime = 100.0
 
@@ -431,7 +440,15 @@ gameWire dict =
       in (newTime, timer newTime)
 
     setTimeWire :: L.GameWire (Float, StageOutput) StageOutput
-    setTimeWire = arr $ \(x, y) -> setTime (round x) y
+    setTimeWire = arr (fmap round . swap) >>> (intWire setTime)
+
+    setScoreWire :: Wire L.TimeStep String (StateT LState L.GameMonad) StageOutput StageOutput
+    setScoreWire = runScoreWire (intWire setScore)
+      where
+        runScoreWire w = mkGen $ \ts output -> do
+          score <- currentScore <$> get
+          (Right out, nw) <- lift $ stepWire w ts (Right (output, score))
+          return (Right out, runScoreWire nw)
 
     runGameState :: Wire L.TimeStep String (StateT LState L.GameMonad) StageInput StageOutput
     runGameState = mkGen $ \ts ipt -> do
@@ -446,8 +463,7 @@ gameWire dict =
       letterFades <- runLetters dict ts ipt
       modify $ \st -> st { letterWires = snd <$> letterFades }
       let out = idleStage // ((\(ipt, (pos, _)) -> (pos, ipt)) <$> letterFades)
-      score <- currentScore <$> get
-      return $ (Right $ setScore score out, runGameState)
+      return $ (Right out, runGameState)
 
     runGame :: LState
                -> Wire L.TimeStep String (StateT LState L.GameMonad) StageInput StageOutput
@@ -487,7 +503,7 @@ gameMenu dict = runWire (selection 0 >>> flickerSelection)
       (loop $ second (delay x) >>> (arr selectionFeedback)) >>>
       menuChoice
 
-    flickerTime = 0.3
+    flickerTime = 0.4
 
     pulseColor :: V3 Float -> [(Int, Int)] -> StageOutput
     pulseColor c positions = mkStaticStageInput findPos
